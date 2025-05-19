@@ -17,27 +17,49 @@ export default function RegisterAndLoginForm() {
   const { setUsername: setLoggedInUsername, setId } = useContext(UserContext);
 
   async function handleSubmit(ev) {
-    ev.preventDefault();
+  ev.preventDefault();
+  console.log("Form submitted, mode:", isLoginOrRegister);
 
+  try {
     if (isLoginOrRegister === 'register') {
       if (password !== confirmPassword) {
         alert("Passwords do not match!");
         return;
       }
 
-      const url = 'register';
+      const url = 'http://localhost:4000/register';
       const payload = { username, password, email, mobileNumber, birthday };
+      console.log("Sending registration payload:", payload);
       const { data } = await axios.post(url, payload);
-      setLoggedInUsername(username);
-      setId(data.id);
+      console.log("Registration response data:", data);
+
+      if (data.id) {
+        alert("Registration successful! You can now log in.");
+        setLoggedInUsername(username);
+        setId(data.id);
+      } else {
+        alert("Registration failed. Please try again.");
+      }
     } else {
-      const url = 'login';
+      const url = 'http://localhost:4000/login';
       const payload = { usernameOrEmail, password };
+      console.log("Sending login payload:", payload);
       const { data } = await axios.post(url, payload);
-      setLoggedInUsername(data.username); 
-      setId(data.id);
+      console.log("Login response data:", data);
+
+      if (data.username && data.id) {
+        setLoggedInUsername(data.username);
+        setId(data.id);
+        alert("Login successful!");
+      } else {
+        alert("Login failed. Please check your credentials.");
+      }
     }
+  } catch (error) {
+    console.error("Error during registration/login:", error);
+    alert("An error occurred: " + (error.response?.data?.message || "Please try again."));
   }
+}
 
   async function handleForgotPasswordSubmit(ev) {
     ev.preventDefault();
@@ -47,7 +69,8 @@ export default function RegisterAndLoginForm() {
       return;
     }
     try {
-      await axios.post('forgot-password', { email: forgotPasswordEmail });
+      // Update the URL below to your actual backend URL if needed
+      await axios.post('http://localhost:4000/forgot-password', { email: forgotPasswordEmail });
       setForgotPasswordMessage('If that email is registered, you will receive password reset instructions.');
     } catch {
       setForgotPasswordMessage('An error occurred. Please try again.');
@@ -213,3 +236,4 @@ export default function RegisterAndLoginForm() {
     </div>
   );
 }
+
