@@ -7,6 +7,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const User = require('./models/User');
 const Message = require('./models/Message');
+const GroupChat = require('./models/GroupChat');
 const { WebSocketServer } = require('ws');
 const http = require('http');
 const fs = require('fs');
@@ -19,18 +20,14 @@ async function connectToDatabase() {
     console.log("Connected to MongoDB");
   } catch (err) {
     console.error("Error connecting to MongoDB:", err);
-    process.exit(1); // Exit the application if the database connection fails
+    process.exit(1);
   }
 }
 
-// Call the function to connect to MongoDB
 connectToDatabase();
-
 
 const jwtSecret = process.env.JWT_SECRET;
 const bcryptSalt = bcrypt.genSaltSync(10);
-
-
 
 const app = express();
 app.use('/uploads', express.static(__dirname + '/uploads'));
@@ -62,19 +59,64 @@ app.get('/test', (req, res) => {
   res.json('test ok');
 });
 
-app.get('/messages/:userId', async (req, res) => {
-  const { userId } = req.params;
-  const userData = await getUserDataFromRequest(req);
-  const ourUserId = userData.userId;
-  const messages = await Message.find({
-    sender: { $in: [userId, ourUserId] },
-    recipient: { $in: [userId, ourUserId] },
-  }).sort({ createdAt: 1 });
-  res.json(messages);
+app.get('/messages/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userData = await getUserDataFromRequest(req);
+    const ourUserId = userData.userId;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid id' });
+    }
+
+    // Check if id is a group chat
+    const group = await GroupChat.findById(id);
+    if (group) {
+      if (!group.members.some(memberId => memberId.equals(ourUserId))) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+      const messages = await Message.find({ recipient: id }).sort({ createdAt: 1 });
+      return res.json(messages);
+    }
+
+    // Otherwise, treat as 1-to-1 chat
+    const otherUser = await User.findById(id);
+    if (!otherUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const messages = await Message.find({
+      $or: [
+        { sender: ourUserId, recipient: id },
+        { sender: id, recipient: ourUserId }
+      ]
+    }).sort({ createdAt: 1 });
+
+    res.json(messages);
+
+  } catch (err) {
+    console.error('Error fetching messages:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/groupchats', async (req, res) => {
+  try {
+    const userData = await getUserDataFromRequest(req);
+    const userId = userData.userId;
+    const groups = await GroupChat.find({ members: userId }).select('name members');
+    res.json(groups);
+  } catch (err) {
+    console.error('Error fetching group chats:', err);
+    res.status(401).json({ error: 'Unauthorized' });
+  }
 });
 
 app.get('/people', async (req, res) => {
-  const users = await User.find({}, { _id: 1, username: 1 });
+  const search = req.query.search || '';
+  const users = await User.find({
+    username: { $regex: search, $options: 'i' }
+  }, { _id: 1, username: 1 });
   res.json(users);
 });
 
@@ -113,7 +155,7 @@ app.post('/register', async (req, res) => {
       if (err) throw err;
       res
         .cookie('token', token, {
-          sameSite: 'lax', // change to 'none' + secure:true for production HTTPS
+          sameSite: 'lax',
           secure: false,
         })
         .status(201)
@@ -152,7 +194,7 @@ app.post('/login', async (req, res) => {
       if (err) throw err;
       res
         .cookie('token', token, {
-          sameSite: 'lax', // 'none' with HTTPS for production
+          sameSite: 'lax',
           secure: false,
         })
         .json({
@@ -164,6 +206,14 @@ app.post('/login', async (req, res) => {
     console.error("Login error:", err);
     res.status(500).json({ message: 'Error during login' });
   }
+});
+
+app.post('/groupchat', async (req, res) => {
+  const { name, members } = req.body;
+  const users = await User.find({ username: { $in: members } });
+  const memberIds = users.map(u => u._id);
+  const group = await GroupChat.create({ name, members: memberIds });
+  res.json({ groupId: group._id });
 });
 
 app.post('/logout', (req, res) => {
@@ -190,21 +240,26 @@ wss.on('connection', (connection, req) => {
     });
   }
 
+  // Heartbeat: robust version
   connection.isAlive = true;
-
-  connection.timer = setInterval(() => {
-    connection.ping();
-    connection.deathTimer = setTimeout(() => {
-      connection.isAlive = false;
-      clearInterval(connection.timer);
+  connection.pingInterval = setInterval(() => {
+    if (!connection.isAlive) {
+      clearInterval(connection.pingInterval);
       connection.terminate();
       notifyAboutOnlinePeople();
       console.log('dead');
-    }, 1000);
-  }, 5000);
+      return;
+    }
+    connection.isAlive = false;
+    connection.ping();
+  }, 30000);
 
   connection.on('pong', () => {
-    clearTimeout(connection.deathTimer);
+    connection.isAlive = true;
+  });
+
+  connection.on('close', () => {
+    clearInterval(connection.pingInterval);
   });
 
   // extract token from cookie
@@ -229,7 +284,6 @@ wss.on('connection', (connection, req) => {
     let filename = null;
 
     if (file) {
-      console.log('size', file.data.length);
       const ext = file.name.split('.').pop();
       filename = Date.now() + '.' + ext;
       const path = __dirname + '/uploads/' + filename;
@@ -247,6 +301,28 @@ wss.on('connection', (connection, req) => {
         file: file ? filename : null,
       });
 
+      // --- GROUP CHAT SUPPORT ---
+      if (mongoose.Types.ObjectId.isValid(recipient)) {
+        const group = await GroupChat.findById(recipient);
+        if (group) {
+          group.members.forEach(memberId => {
+            if (memberId.toString() !== connection.userId) {
+              [...wss.clients]
+                .filter(c => c.userId === memberId.toString())
+                .forEach(c => c.send(JSON.stringify({
+                  text,
+                  sender: connection.userId,
+                  recipient,
+                  file: file ? filename : null,
+                  _id: messageDoc._id,
+                })));
+            }
+          });
+          return;
+        }
+      }
+
+      // --- 1-to-1 fallback ---
       [...wss.clients]
         .filter(c => c.userId === recipient)
         .forEach(c => c.send(JSON.stringify({

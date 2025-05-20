@@ -69,7 +69,6 @@ export default function RegisterAndLoginForm() {
       return;
     }
     try {
-      // Update the URL below to your actual backend URL if needed
       await axios.post('http://localhost:4000/forgot-password', { email: forgotPasswordEmail });
       setForgotPasswordMessage('If that email is registered, you will receive password reset instructions.');
     } catch {
